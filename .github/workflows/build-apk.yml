@@ -1,0 +1,537 @@
+name: Build Android APK
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build-debug-apk:
+    name: Build Debug APK
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && !startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Build web bundle (Vite -> dist/)
+        run: npm run build
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Install Android SDK 35
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+          ls "$ANDROID_HOME/cmdline-tools" || true
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [ -x "$SDKMANAGER" ]; then
+            "$SDKMANAGER" --install "platforms;android-35" "build-tools;35.0.0" "platform-tools" || true
+            yes | "$SDKMANAGER" --licenses || true
+          else
+            echo "sdkmanager not found at $SDKMANAGER, relying on preinstalled SDK"
+          fi
+
+      - name: Add Capacitor Android platform (idempotent)
+        run: npx --yes cap add android
+
+      - name: Sync web assets into android/app
+        run: npx cap sync android
+
+      - name: Disable Android system font scaling and lock text zoom
+        run: |
+          MAIN_ACTIVITY_DIR="android/app/src/main/java/com/sageinventory/app"
+          mkdir -p "$MAIN_ACTIVITY_DIR"
+          cat > "$MAIN_ACTIVITY_DIR/MainActivity.java" <<'JAVA'
+          package com.sageinventory.app;
+
+          import android.os.Bundle;
+          import android.webkit.WebSettings;
+          import com.getcapacitor.BridgeActivity;
+
+          public class MainActivity extends BridgeActivity {
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  applyFixedFontSettings();
+              }
+
+              @Override
+              public void onResume() {
+                  super.onResume();
+                  applyFixedFontSettings();
+              }
+
+              private void applyFixedFontSettings() {
+                  if (bridge != null && bridge.getWebView() != null) {
+                      WebSettings settings = bridge.getWebView().getSettings();
+                      // Lock WebView text zoom to 100% so Android system font-size/accessibility scaling
+                      // does not alter or distort UI layouts and button dimensions.
+                      settings.setTextZoom(100);
+                  }
+              }
+          }
+          JAVA
+
+      - name: Stamp launcher icon and label
+        run: |
+          # 1. App name: write res/values/strings.xml so the launcher label is 'StockApp'
+          mkdir -p android/app/src/main/res/values
+          cat > android/app/src/main/res/values/strings.xml <<'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">StockApp</string>
+              <string name="title_activity_main">StockApp</string>
+              <string name="package_name">com.sageinventory.app</string>
+              <string name="custom_url_scheme">com.sageinventory.app</string>
+          </resources>
+          XML
+
+          # 2. Launcher icon: copy the public PWA icons into every Android mipmap density bucket
+          for d in mdpi hdpi xhdpi xxhdpi xxxhdpi; do
+            mkdir -p "android/app/src/main/res/mipmap-$d"
+            cp public/icon_192.png "android/app/src/main/res/mipmap-$d/ic_launcher.png"
+            cp public/icon_192.png "android/app/src/main/res/mipmap-$d/ic_launcher_round.png"
+            cp public/icon_192.png "android/app/src/main/res/mipmap-$d/ic_launcher_foreground.png"
+          done
+
+          # 3. Adaptive icon for Android 8.0+ (API 26+)
+          mkdir -p android/app/src/main/res/mipmap-anydpi-v26
+          cat > android/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml <<'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/ic_launcher_background"/>
+              <foreground android:drawable="@mipmap/ic_launcher_foreground"/>
+          </adaptive-icon>
+          XML
+          cp android/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml android/app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml
+
+      - name: Fix native splash background color
+        run: |
+          STYLES_DIR=android/app/src/main/res/values
+          STYLES_FILE="$STYLES_DIR/styles.xml"
+          mkdir -p "$STYLES_DIR"
+          if [ -f "$STYLES_DIR/ic_launcher_background.xml" ]; then
+            cat > "$STYLES_DIR/ic_launcher_background.xml" <<'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="ic_launcher_background">#F7F9FB</color>
+          </resources>
+          XML
+          fi
+          if [ -f "$STYLES_DIR/colors.xml" ]; then
+            sed -i 's|<color name="ic_launcher_background">.*</color>|<color name="ic_launcher_background">#F7F9FB</color>|' "$STYLES_DIR/colors.xml" 2>/dev/null || true
+          fi
+          if ! grep -q 'splash_background' "$STYLES_DIR/"*.xml 2>/dev/null; then
+            if [ -f "$STYLES_DIR/colors.xml" ]; then
+              printf '\n    <color name="splash_background">#F7F9FB</color>\n' >> "$STYLES_DIR/colors.xml"
+            else
+              cat > "$STYLES_DIR/colors.xml" <<'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="splash_background">#F7F9FB</color>
+          </resources>
+          XML
+            fi
+          fi
+          cat > "$STYLES_FILE" <<'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="AppTheme" parent="Theme.AppCompat.NoActionBar">
+                  <item name="android:background">@color/splash_background</item>
+              </style>
+              <style name="AppTheme.NoActionBar" parent="Theme.AppCompat.NoActionBar">
+                  <item name="windowActionBar">false</item>
+                  <item name="windowNoTitle">true</item>
+                  <item name="android:background">@color/splash_background</item>
+                  <item name="android:windowBackground">@color/splash_background</item>
+              </style>
+              <style name="AppTheme.NoActionBarLaunch" parent="AppTheme.NoActionBar">
+                  <item name="android:background">@color/splash_background</item>
+                  <item name="android:windowBackground">@color/splash_background</item>
+              </style>
+          </resources>
+          XML
+          rm -f android/app/src/main/res/drawable/splash.png
+          rm -f android/app/src/main/res/drawable-port-*/splash.png 2>/dev/null || true
+          rm -f android/app/src/main/res/drawable/splash.xml 2>/dev/null || true
+
+      - name: Declare camera permission for barcode scanner
+        run: |
+          MANIFEST=android/app/src/main/AndroidManifest.xml
+          grep -q "android.permission.CAMERA" "$MANIFEST" || sed -i 's|<application|<uses-permission android:name="android.permission.CAMERA"/>\n  <application|' "$MANIFEST"
+          grep -n "uses-permission" "$MANIFEST"
+
+      - name: Neutralize Android 12+ system splash icon (values-v31)
+        run: |
+          RES=android/app/src/main/res
+          mkdir -p "$RES/drawable"
+          cat > "$RES/drawable/transparent_splash.xml" <<'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <solid android:color="#00000000"/>
+          </shape>
+          XML
+
+          mkdir -p "$RES/values-v31"
+          cat > "$RES/values-v31/styles.xml" <<'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="AppTheme" parent="Theme.AppCompat.NoActionBar">
+                  <item name="android:background">@color/splash_background</item>
+                  <item name="android:windowSplashScreenBackground">@color/splash_background</item>
+                  <item name="android:windowSplashScreenAnimatedIcon">@drawable/transparent_splash</item>
+                  <item name="android:windowSplashScreenIconBackgroundColor">@android:color/transparent</item>
+              </style>
+              <style name="AppTheme.NoActionBar" parent="Theme.AppCompat.NoActionBar">
+                  <item name="windowActionBar">false</item>
+                  <item name="windowNoTitle">true</item>
+                  <item name="android:background">@color/splash_background</item>
+                  <item name="android:windowBackground">@color/splash_background</item>
+                  <item name="android:windowSplashScreenBackground">@color/splash_background</item>
+                  <item name="android:windowSplashScreenAnimatedIcon">@drawable/transparent_splash</item>
+                  <item name="android:windowSplashScreenIconBackgroundColor">@android:color/transparent</item>
+              </style>
+              <style name="AppTheme.NoActionBarLaunch" parent="AppTheme.NoActionBar">
+                  <item name="android:background">@color/splash_background</item>
+                  <item name="android:windowBackground">@color/splash_background</item>
+                  <item name="android:windowSplashScreenBackground">@color/splash_background</item>
+                  <item name="android:windowSplashScreenAnimatedIcon">@drawable/transparent_splash</item>
+                  <item name="android:windowSplashScreenIconBackgroundColor">@android:color/transparent</item>
+              </style>
+          </resources>
+          XML
+          echo "--- values-v31/styles.xml ---"
+          cat "$RES/values-v31/styles.xml"
+
+      - name: Make gradlew executable
+        run: chmod +x android/gradlew
+
+      - name: Build debug APK with Gradle
+        working-directory: android
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Locate Debug APK
+        id: locate
+        run: |
+          APK=$(find android/app/build/outputs/apk/debug -name '*.apk' | head -n1)
+          echo "apk_path=$APK" >> "$GITHUB_OUTPUT"
+          echo "Debug APK path: $APK"
+
+      - name: Publish APK to rolling release (apk-latest)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          APK="${{ steps.locate.outputs.apk_path }}"
+          cp "$APK" stockapp-debug.apk
+          gh release create apk-latest \
+            --prerelease \
+            --title "Latest StockApp debug APK" \
+            --notes "Rolling prerelease - rebuilt automatically on every push to main." \
+            || true
+          gh release upload apk-latest stockapp-debug.apk --clobber
+
+  build-release-apk:
+    name: Build Release APK
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Build web bundle (Vite -> dist/)
+        run: npm run build
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Install Android SDK 35
+        run: |
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [ -x "$SDKMANAGER" ]; then
+            "$SDKMANAGER" --install "platforms;android-35" "build-tools;35.0.0" "platform-tools" || true
+            yes | "$SDKMANAGER" --licenses || true
+          fi
+
+      - name: Add Capacitor Android platform (idempotent)
+        run: npx --yes cap add android
+
+      - name: Sync web assets into android/app
+        run: npx cap sync android
+
+      - name: Disable Android system font scaling and lock text zoom
+        run: |
+          MAIN_ACTIVITY_DIR="android/app/src/main/java/com/sageinventory/app"
+          mkdir -p "$MAIN_ACTIVITY_DIR"
+          cat > "$MAIN_ACTIVITY_DIR/MainActivity.java" <<'JAVA'
+          package com.sageinventory.app;
+
+          import android.os.Bundle;
+          import android.webkit.WebSettings;
+          import com.getcapacitor.BridgeActivity;
+
+          public class MainActivity extends BridgeActivity {
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  applyFixedFontSettings();
+              }
+
+              @Override
+              public void onResume() {
+                  super.onResume();
+                  applyFixedFontSettings();
+              }
+
+              private void applyFixedFontSettings() {
+                  if (bridge != null && bridge.getWebView() != null) {
+                      WebSettings settings = bridge.getWebView().getSettings();
+                      // Lock WebView text zoom to 100% so Android system font-size/accessibility scaling
+                      // does not alter or distort UI layouts and button dimensions.
+                      settings.setTextZoom(100);
+                  }
+              }
+          }
+          JAVA
+
+      - name: Stamp launcher icon and label
+        run: |
+          mkdir -p android/app/src/main/res/values
+          cat > android/app/src/main/res/values/strings.xml <<'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">StockApp</string>
+              <string name="title_activity_main">StockApp</string>
+              <string name="package_name">com.sageinventory.app</string>
+              <string name="custom_url_scheme">com.sageinventory.app</string>
+          </resources>
+          XML
+
+          for d in mdpi hdpi xhdpi xxhdpi xxxhdpi; do
+            mkdir -p "android/app/src/main/res/mipmap-$d"
+            cp public/icon_192.png "android/app/src/main/res/mipmap-$d/ic_launcher.png"
+            cp public/icon_192.png "android/app/src/main/res/mipmap-$d/ic_launcher_round.png"
+            cp public/icon_192.png "android/app/src/main/res/mipmap-$d/ic_launcher_foreground.png"
+          done
+
+          mkdir -p android/app/src/main/res/mipmap-anydpi-v26
+          cat > android/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml <<'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/ic_launcher_background"/>
+              <foreground android:drawable="@mipmap/ic_launcher_foreground"/>
+          </adaptive-icon>
+          XML
+          cp android/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml android/app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml
+
+      - name: Fix native splash background color
+        run: |
+          STYLES_DIR=android/app/src/main/res/values
+          STYLES_FILE="$STYLES_DIR/styles.xml"
+          mkdir -p "$STYLES_DIR"
+          if [ -f "$STYLES_DIR/ic_launcher_background.xml" ]; then
+            cat > "$STYLES_DIR/ic_launcher_background.xml" <<'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="ic_launcher_background">#F7F9FB</color>
+          </resources>
+          XML
+          fi
+          if [ -f "$STYLES_DIR/colors.xml" ]; then
+            sed -i 's|<color name="ic_launcher_background">.*</color>|<color name="ic_launcher_background">#F7F9FB</color>|' "$STYLES_DIR/colors.xml" 2>/dev/null || true
+          fi
+          if ! grep -q 'splash_background' "$STYLES_DIR/"*.xml 2>/dev/null; then
+            if [ -f "$STYLES_DIR/colors.xml" ]; then
+              printf '\n    <color name="splash_background">#F7F9FB</color>\n' >> "$STYLES_DIR/colors.xml"
+            else
+              cat > "$STYLES_DIR/colors.xml" <<'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="splash_background">#F7F9FB</color>
+          </resources>
+          XML
+            fi
+          fi
+          cat > "$STYLES_FILE" <<'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="AppTheme" parent="Theme.AppCompat.NoActionBar">
+                  <item name="android:background">@color/splash_background</item>
+              </style>
+              <style name="AppTheme.NoActionBar" parent="Theme.AppCompat.NoActionBar">
+                  <item name="windowActionBar">false</item>
+                  <item name="windowNoTitle">true</item>
+                  <item name="android:background">@color/splash_background</item>
+                  <item name="android:windowBackground">@color/splash_background</item>
+              </style>
+              <style name="AppTheme.NoActionBarLaunch" parent="AppTheme.NoActionBar">
+                  <item name="android:background">@color/splash_background</item>
+                  <item name="android:windowBackground">@color/splash_background</item>
+              </style>
+          </resources>
+          XML
+          rm -f android/app/src/main/res/drawable/splash.png
+          rm -f android/app/src/main/res/drawable-port-*/splash.png 2>/dev/null || true
+          rm -f android/app/src/main/res/drawable/splash.xml 2>/dev/null || true
+
+      - name: Declare camera permission for barcode scanner
+        run: |
+          MANIFEST=android/app/src/main/AndroidManifest.xml
+          grep -q "android.permission.CAMERA" "$MANIFEST" || sed -i 's|<application|<uses-permission android:name="android.permission.CAMERA"/>\n  <application|' "$MANIFEST"
+
+      - name: Bump version code and name from git tag if present
+        run: |
+          TAG="${{ github.ref_name }}"
+          if [[ "$TAG" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            V_MAJOR="${BASH_REMATCH[1]}"
+            V_MINOR="${BASH_REMATCH[2]}"
+            V_PATCH="${BASH_REMATCH[3]}"
+            VERSION_CODE=$(( V_MAJOR * 10000 + V_MINOR * 100 + V_PATCH ))
+            VERSION_NAME="${V_MAJOR}.${V_MINOR}.${V_PATCH}"
+            echo "Applying version from tag: $VERSION_NAME (code: $VERSION_CODE)"
+            sed -i "s/versionCode [0-9]\+/versionCode $VERSION_CODE/" android/app/build.gradle
+            sed -i "s/versionName \".*\"/versionName \"$VERSION_NAME\"/" android/app/build.gradle
+          fi
+
+      - name: Configure release signing
+        env:
+          KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            mkdir -p android/keystores
+            echo "$KEYSTORE_BASE64" | base64 --decode > android/keystores/release.keystore
+            cat > android/key.properties <<EOF
+          storeFile=../keystores/release.keystore
+          storePassword=$KEYSTORE_PASSWORD
+          keyAlias=$KEY_ALIAS
+          keyPassword=$KEY_PASSWORD
+          EOF
+            python3 -c "
+          import re
+          with open('android/app/build.gradle', 'r') as f:
+              content = f.read()
+
+          config = '''
+          def keyPropertiesFile = rootProject.file('key.properties')
+          def keyProperties = new Properties()
+          if (keyPropertiesFile.exists()) {
+              keyProperties.load(new FileInputStream(keyPropertiesFile))
+          }
+
+          android {
+              signingConfigs {
+                  release {
+                      if (keyPropertiesFile.exists()) {
+                          storeFile file(keyProperties['storeFile'])
+                          storePassword keyProperties['storePassword']
+                          keyAlias keyProperties['keyAlias']
+                          keyPassword keyProperties['keyPassword']
+                      }
+                  }
+              }
+          '''
+          content = content.replace('android {', config, 1)
+          content = re.sub(r'buildTypes\s*\{\s*release\s*\{', 'buildTypes {\n        release {\n            signingConfig signingConfigs.release\n', content)
+          with open('android/app/build.gradle', 'w') as f:
+              f.write(content)
+          "
+            echo "Signing configured for release build."
+          else
+            echo "### Notice: Release keystore secret (RELEASE_KEYSTORE_BASE64) not found." >> $GITHUB_STEP_SUMMARY
+            echo "Building unsigned release APK." >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Neutralize Android 12+ system splash icon (values-v31)
+        run: |
+          RES=android/app/src/main/res
+          mkdir -p "$RES/drawable"
+          cat > "$RES/drawable/transparent_splash.xml" <<'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <solid android:color="#00000000"/>
+          </shape>
+          XML
+
+          mkdir -p "$RES/values-v31"
+          cat > "$RES/values-v31/styles.xml" <<'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="AppTheme" parent="Theme.AppCompat.NoActionBar">
+                  <item name="android:background">@color/splash_background</item>
+                  <item name="android:windowSplashScreenBackground">@color/splash_background</item>
+                  <item name="android:windowSplashScreenAnimatedIcon">@drawable/transparent_splash</item>
+                  <item name="android:windowSplashScreenIconBackgroundColor">@android:color/transparent</item>
+              </style>
+              <style name="AppTheme.NoActionBar" parent="Theme.AppCompat.NoActionBar">
+                  <item name="windowActionBar">false</item>
+                  <item name="windowNoTitle">true</item>
+                  <item name="android:background">@color/splash_background</item>
+                  <item name="android:windowBackground">@color/splash_background</item>
+                  <item name="android:windowSplashScreenBackground">@color/splash_background</item>
+                  <item name="android:windowSplashScreenAnimatedIcon">@drawable/transparent_splash</item>
+                  <item name="android:windowSplashScreenIconBackgroundColor">@android:color/transparent</item>
+              </style>
+              <style name="AppTheme.NoActionBarLaunch" parent="AppTheme.NoActionBar">
+                  <item name="android:background">@color/splash_background</item>
+                  <item name="android:windowBackground">@color/splash_background</item>
+                  <item name="android:windowSplashScreenBackground">@color/splash_background</item>
+                  <item name="android:windowSplashScreenAnimatedIcon">@drawable/transparent_splash</item>
+                  <item name="android:windowSplashScreenIconBackgroundColor">@android:color/transparent</item>
+              </style>
+          </resources>
+          XML
+          echo "--- values-v31/styles.xml ---"
+          cat "$RES/values-v31/styles.xml"
+
+      - name: Make gradlew executable
+        run: chmod +x android/gradlew
+
+      - name: Build release APK with Gradle
+        working-directory: android
+        run: ./gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: Locate Release APK
+        id: locate
+        run: |
+          APK=$(find android/app/build/outputs/apk/release -name '*.apk' | head -n1)
+          echo "apk_path=$APK" >> "$GITHUB_OUTPUT"
+          echo "Release APK path: $APK"
+
+      - name: Upload Release APK (retain 30 days)
+        uses: actions/upload-artifact@v4
+        with:
+          name: sage-inventory-release-apk
+          path: ${{ steps.locate.outputs.apk_path }}
+          retention-days: 30

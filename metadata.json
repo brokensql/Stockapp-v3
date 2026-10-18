@@ -1,0 +1,5 @@
+{
+  "name": "StockApp",
+  "description": "A simple way to manage your inventory and sales.",
+  "requestFramePermissions": ["camera"]
+}

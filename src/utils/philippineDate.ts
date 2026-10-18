@@ -1,0 +1,481 @@
+/**
+ * Philippine Date & Timezone Utilities (PST/PHT, UTC+8, Asia/Manila)
+ * Ensures all transactions, chart timeframes, date grouping, and relative
+ * growth indicators are computed strictly against the Philippines timezone.
+ */
+
+import { SaleTransaction } from '../types';
+
+export const PHILIPPINES_TIMEZONE = 'Asia/Manila';
+
+export interface PHTDateParts {
+  year: number;
+  month: number; // 1-12
+  day: number;
+  hour: number;
+  minute: number;
+  dateKey: string; // YYYY-MM-DD in PHT
+}
+
+/**
+ * Returns year, month, day, hour, minute, and YYYY-MM-DD dateKey
+ * strictly evaluated in the Philippine Timezone (Asia/Manila, UTC+8).
+ */
+export function getPHTParts(dateInput: Date | number | string = new Date()): PHTDateParts {
+  const d = typeof dateInput === 'number' || typeof dateInput === 'string'
+    ? new Date(dateInput)
+    : dateInput;
+  const validDate = isNaN(d.getTime()) ? new Date() : d;
+
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: PHILIPPINES_TIMEZONE,
+    year: 'numeric',
+    month: 'numeric',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: 'numeric',
+    hour12: false,
+  });
+
+  const parts = formatter.formatToParts(validDate);
+  const map: Record<string, string> = {};
+  for (const p of parts) {
+    map[p.type] = p.value;
+  }
+
+  const year = parseInt(map.year || '2026', 10);
+  const month = parseInt(map.month || '1', 10);
+  const day = parseInt(map.day || '1', 10);
+  const hour = parseInt(map.hour || '0', 10);
+  const minute = parseInt(map.minute || '0', 10);
+
+  const mm = String(month).padStart(2, '0');
+  const dd = String(day).padStart(2, '0');
+  const dateKey = `${year}-${mm}-${dd}`;
+
+  return { year, month, day, hour, minute, dateKey };
+}
+
+/**
+ * Returns UTC millisecond timestamp representing midnight (00:00:00)
+ * of the current day in Philippine Time (UTC+8).
+ */
+export function getPHTTodayMidnightEpoch(): number {
+  const parts = getPHTParts(new Date());
+  // Midnight in PHT is (Date.UTC(y, m-1, d, 0, 0, 0) - 8 hours)
+  return Date.UTC(parts.year, parts.month - 1, parts.day, 0, 0, 0) - 8 * 60 * 60 * 1000;
+}
+
+/**
+ * Returns UTC millisecond timestamp representing midnight (00:00:00)
+ * of the specified date evaluated in Philippine Time (Asia/Manila, UTC+8).
+ */
+export function getPHTDayStartEpoch(dateInput: Date | number | string = new Date()): number {
+  const parts = getPHTParts(dateInput);
+  return Date.UTC(parts.year, parts.month - 1, parts.day, 0, 0, 0) - 8 * 60 * 60 * 1000;
+}
+
+/**
+ * Returns UTC millisecond timestamp representing 00:00:00 on the 1st day
+ * of the month in Philippine Time (Asia/Manila, UTC+8).
+ */
+export function getPHTMonthStartEpoch(dateInput: Date | number | string = new Date()): number {
+  const parts = getPHTParts(dateInput);
+  return Date.UTC(parts.year, parts.month - 1, 1, 0, 0, 0) - 8 * 60 * 60 * 1000;
+}
+
+/**
+ * Returns UTC millisecond timestamp representing 00:00:00 on January 1st
+ * of the year in Philippine Time (Asia/Manila, UTC+8).
+ */
+export function getPHTYearStartEpoch(dateInput: Date | number | string = new Date()): number {
+  const parts = getPHTParts(dateInput);
+  return Date.UTC(parts.year, 0, 1, 0, 0, 0) - 8 * 60 * 60 * 1000;
+}
+
+/**
+ * Accurately calculates the number of calendar days in a specific month (1-12) for a given year
+ * in a timezone-independent manner.
+ */
+export function getPHTDaysInMonth(year: number, month: number): number {
+  return new Date(Date.UTC(year, month, 0)).getUTCDate();
+}
+
+/**
+ * Returns PHTDateParts for yesterday relative to the provided reference date in Philippine Time.
+ */
+export function getPHTYesterdayParts(referenceDate: Date | number | string = new Date()): PHTDateParts {
+  const midnightToday = getPHTDayStartEpoch(referenceDate);
+  const midnightYesterday = midnightToday - 24 * 60 * 60 * 1000;
+  return getPHTParts(midnightYesterday + 12 * 60 * 60 * 1000);
+}
+
+/**
+ * Returns the YYYY-MM-DD dateKey string for yesterday strictly evaluated in Philippine Time.
+ */
+export function getPHTYesterdayDateKey(referenceDate: Date | number | string = new Date()): string {
+  return getPHTYesterdayParts(referenceDate).dateKey;
+}
+
+/**
+ * Accurately determines if a transaction falls within a designated
+ * Philippine Time (Asia/Manila) calendar period without manual timezone shifting.
+ * Respects strict Philippine calendar boundaries for today, week, month, and year.
+ */
+export function isTransactionInPHTPeriod(
+  tx: SaleTransaction,
+  timeframe: 'day' | 'week' | 'month' | 'year',
+  referenceDate: Date | number = new Date()
+): boolean {
+  const txEpoch = getTransactionTimestamp(tx);
+  const refParts = getPHTParts(referenceDate);
+  const txParts = getPHTParts(txEpoch);
+
+  if (timeframe === 'day') {
+    return txParts.dateKey === refParts.dateKey;
+  }
+
+  if (timeframe === 'week') {
+    // 7-day rolling window ending today in PHT (inclusive of today)
+    const startOfToday = getPHTDayStartEpoch(referenceDate);
+    const sevenDaysAgoMidnight = startOfToday - 6 * 24 * 60 * 60 * 1000;
+    const endOfToday = startOfToday + 24 * 60 * 60 * 1000;
+    return txEpoch >= sevenDaysAgoMidnight && txEpoch < endOfToday;
+  }
+
+  if (timeframe === 'month') {
+    return txParts.year === refParts.year && txParts.month === refParts.month;
+  }
+
+  if (timeframe === 'year') {
+    return txParts.year === refParts.year;
+  }
+
+  return true;
+}
+
+/**
+ * Safely extracts the transaction epoch millisecond timestamp.
+ */
+export function getTransactionTimestamp(tx: SaleTransaction): number {
+  if (tx.createdAt && typeof tx.createdAt === 'number' && !isNaN(tx.createdAt)) {
+    return tx.createdAt;
+  }
+
+  // Handle tx-{timestamp} numeric IDs
+  const match = tx.id.match(/^tx-(\d{10,14})$/);
+  if (match) {
+    const num = parseInt(match[1], 10);
+    if (!isNaN(num) && num > 1000000000) {
+      return num;
+    }
+  }
+
+  // Handle tx_{base36time}_{rand} format generated by generateEntityId
+  const base36Match = tx.id.match(/^tx_([a-z0-9]+)_[a-z0-9]+/i);
+  if (base36Match) {
+    const epoch = parseInt(base36Match[1], 36);
+    if (!isNaN(epoch) && epoch > 1500000000000) {
+      return epoch;
+    }
+  }
+
+  if (tx.timestamp) {
+    if (tx.timestamp.startsWith('Today')) {
+      return Date.now();
+    }
+    if (tx.timestamp.startsWith('Yesterday')) {
+      return Date.now() - 24 * 60 * 60 * 1000;
+    }
+    const parsed = Date.parse(tx.timestamp);
+    if (!isNaN(parsed)) {
+      return parsed;
+    }
+  }
+
+  return Date.now();
+}
+
+/**
+ * Formats a transaction time into Philippine Time format.
+ * E.g. "Today, 3:45 PM", "Yesterday, 10:15 AM", or "Sep 3, 2026, 2:30 PM"
+ */
+export function formatPHTTimestamp(dateInput: Date | number | string): string {
+  const d = typeof dateInput === 'number' || typeof dateInput === 'string'
+    ? new Date(dateInput)
+    : dateInput;
+  const validDate = isNaN(d.getTime()) ? new Date() : d;
+
+  const todayParts = getPHTParts(new Date());
+  const txParts = getPHTParts(validDate);
+
+  const midnightToday = getPHTTodayMidnightEpoch();
+  const midnightYesterday = midnightToday - 24 * 60 * 60 * 1000;
+  const yesterdayParts = getPHTParts(midnightYesterday + 1000);
+
+  const timeFormatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: PHILIPPINES_TIMEZONE,
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+  });
+  const timeStr = timeFormatter.format(validDate);
+
+  if (txParts.dateKey === todayParts.dateKey) {
+    return `Today, ${timeStr}`;
+  } else if (txParts.dateKey === yesterdayParts.dateKey) {
+    return `Yesterday, ${timeStr}`;
+  } else {
+    const dateFormatter = new Intl.DateTimeFormat('en-US', {
+      timeZone: PHILIPPINES_TIMEZONE,
+      month: 'short',
+      day: 'numeric',
+      year: txParts.year !== todayParts.year ? 'numeric' : undefined,
+    });
+    return `${dateFormatter.format(validDate)}, ${timeStr}`;
+  }
+}
+
+export interface SalesGrowthMetrics {
+  todayTotal: number;
+  yesterdayTotal: number;
+  dayGrowthDiff: number;
+  changeAmount: number;
+  changePercentage: number;
+  isPositive: boolean;
+  hasSalesToday: boolean;
+  hasSalesYesterday: boolean;
+  todayCount: number;
+  yesterdayCount: number;
+  thisWeekTotal: number;
+  lastWeekTotal: number;
+  growthDiff: number;
+  weekGrowthPercentage: number;
+  thisMonthTotal: number;
+  lastMonthTotal: number;
+  monthGrowthDiff: number;
+  thisMonthCount: number;
+  lastMonthCount: number;
+}
+
+/**
+ * Calculates genuine sales growth comparing Today vs Yesterday,
+ * This Week vs Last Week, and This Month vs Last Month strictly derived from PHT transactions.
+ */
+export function calculatePHTSalesGrowth(sales: SaleTransaction[]): SalesGrowthMetrics {
+  const now = new Date();
+  const todayParts = getPHTParts(now);
+  const yesterdayParts = getPHTYesterdayParts(now);
+  const midnightToday = getPHTTodayMidnightEpoch();
+
+  // Month prefixes
+  const thisYearMonth = `${todayParts.year}-${String(todayParts.month).padStart(2, '0')}`;
+  const prevMonth = todayParts.month === 1 ? 12 : todayParts.month - 1;
+  const prevMonthYear = todayParts.month === 1 ? todayParts.year - 1 : todayParts.year;
+  const lastYearMonth = `${prevMonthYear}-${String(prevMonth).padStart(2, '0')}`;
+
+  // 7 days window (today back 6 days)
+  const sevenDaysAgoMidnight = midnightToday - 6 * 24 * 3600 * 1000;
+  // 14 to 7 days window
+  const fourteenDaysAgoMidnight = midnightToday - 13 * 24 * 3600 * 1000;
+
+  let todayTotal = 0;
+  let todayCount = 0;
+  let yesterdayTotal = 0;
+  let yesterdayCount = 0;
+  let thisWeekTotal = 0;
+  let lastWeekTotal = 0;
+  let thisMonthTotal = 0;
+  let thisMonthCount = 0;
+  let lastMonthTotal = 0;
+  let lastMonthCount = 0;
+
+  for (const s of sales || []) {
+    const epoch = getTransactionTimestamp(s);
+    const p = getPHTParts(epoch);
+    const total = typeof s.total === 'number' && !isNaN(s.total) ? s.total : 0;
+
+    if (p.dateKey === todayParts.dateKey) {
+      todayTotal += total;
+      todayCount += 1;
+    } else if (p.dateKey === yesterdayParts.dateKey) {
+      yesterdayTotal += total;
+      yesterdayCount += 1;
+    }
+
+    if (epoch >= sevenDaysAgoMidnight) {
+      thisWeekTotal += total;
+    } else if (epoch >= fourteenDaysAgoMidnight && epoch < sevenDaysAgoMidnight) {
+      lastWeekTotal += total;
+    }
+
+    if (p.dateKey.startsWith(thisYearMonth)) {
+      thisMonthTotal += total;
+      thisMonthCount += 1;
+    } else if (p.dateKey.startsWith(lastYearMonth)) {
+      lastMonthTotal += total;
+      lastMonthCount += 1;
+    }
+  }
+
+  const diff = todayTotal - yesterdayTotal;
+  const changeAmount = Math.abs(diff);
+  const isPositive = diff >= 0;
+
+  let changePercentage = 0;
+  if (yesterdayTotal > 0) {
+    changePercentage = Math.round((Math.abs(diff) / yesterdayTotal) * 1000) / 10;
+  } else if (todayTotal > 0) {
+    changePercentage = 100.0;
+  } else {
+    changePercentage = 0.0;
+  }
+
+  const growthDiff = thisWeekTotal - lastWeekTotal;
+  let weekGrowthPercentage = 0;
+  if (lastWeekTotal > 0) {
+    weekGrowthPercentage = Math.round((Math.abs(growthDiff) / lastWeekTotal) * 1000) / 10;
+  } else if (thisWeekTotal > 0) {
+    weekGrowthPercentage = 100.0;
+  }
+
+  const monthGrowthDiff = thisMonthTotal - lastMonthTotal;
+
+  return {
+    todayTotal,
+    yesterdayTotal,
+    dayGrowthDiff: diff,
+    changeAmount,
+    changePercentage,
+    isPositive,
+    hasSalesToday: todayTotal > 0,
+    hasSalesYesterday: yesterdayTotal > 0,
+    todayCount,
+    yesterdayCount,
+    thisWeekTotal,
+    lastWeekTotal,
+    growthDiff,
+    weekGrowthPercentage,
+    thisMonthTotal,
+    lastMonthTotal,
+    monthGrowthDiff,
+    thisMonthCount,
+    lastMonthCount,
+  };
+}
+
+export interface ChartDataPoint {
+  label: string;
+  fullDate: string;
+  dateKey: string;
+  value: number;
+}
+
+/**
+ * Dynamically aggregates transactions into chart data points for 7d, 30d, or 90d
+ * based on Philippine calendar days (Asia/Manila).
+ */
+export function generatePHTChartDataset(
+  sales: SaleTransaction[],
+  timeframe: '7d' | '30d' | '90d'
+): { points: ChartDataPoint[]; total: number } {
+  // Aggregate sales by Philippine dateKey (YYYY-MM-DD)
+  const salesByDate: Record<string, number> = {};
+  for (const s of sales) {
+    const epoch = getTransactionTimestamp(s);
+    const dateKey = getPHTParts(epoch).dateKey;
+    salesByDate[dateKey] = (salesByDate[dateKey] || 0) + s.total;
+  }
+
+  const phtMidnight = getPHTTodayMidnightEpoch();
+  const dayFormatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: PHILIPPINES_TIMEZONE,
+    weekday: 'short',
+  });
+  const monthDayFormatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: PHILIPPINES_TIMEZONE,
+    month: 'short',
+    day: 'numeric',
+  });
+  const fullFormatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: PHILIPPINES_TIMEZONE,
+    weekday: 'short',
+    month: 'short',
+    day: 'numeric',
+  });
+
+  const points: ChartDataPoint[] = [];
+  let total = 0;
+
+  if (timeframe === '7d') {
+    // 7 consecutive days ending today
+    for (let i = 6; i >= 0; i--) {
+      const epoch = phtMidnight - (i * 24 - 12) * 3600 * 1000;
+      const targetDate = new Date(epoch);
+      const parts = getPHTParts(epoch);
+      const val = salesByDate[parts.dateKey] || 0;
+      total += val;
+
+      const isToday = i === 0;
+      const label = isToday ? 'Today' : dayFormatter.format(targetDate);
+      const fullDate = isToday
+        ? `Today (${fullFormatter.format(targetDate)})`
+        : fullFormatter.format(targetDate);
+
+      points.push({
+        label,
+        fullDate,
+        dateKey: parts.dateKey,
+        value: val,
+      });
+    }
+  } else if (timeframe === '30d') {
+    // 30 consecutive days ending today
+    for (let i = 29; i >= 0; i--) {
+      const epoch = phtMidnight - (i * 24 - 12) * 3600 * 1000;
+      const targetDate = new Date(epoch);
+      const parts = getPHTParts(epoch);
+      const val = salesByDate[parts.dateKey] || 0;
+      total += val;
+
+      const label = monthDayFormatter.format(targetDate);
+      const fullDate = fullFormatter.format(targetDate);
+
+      points.push({
+        label,
+        fullDate,
+        dateKey: parts.dateKey,
+        value: val,
+      });
+    }
+  } else {
+    // 90d: 13 weekly points ending today
+    for (let week = 12; week >= 0; week--) {
+      let weekVal = 0;
+      let representativeDate = new Date();
+      let lastParts = getPHTParts(new Date());
+
+      for (let day = 6; day >= 0; day--) {
+        const dayIndex = week * 7 + day;
+        const epoch = phtMidnight - (dayIndex * 24 - 12) * 3600 * 1000;
+        const parts = getPHTParts(epoch);
+        const dayVal = salesByDate[parts.dateKey] || 0;
+        weekVal += dayVal;
+        total += dayVal;
+        if (day === 0) {
+          representativeDate = new Date(epoch);
+          lastParts = parts;
+        }
+      }
+
+      points.push({
+        label: monthDayFormatter.format(representativeDate),
+        fullDate: `Week ending ${fullFormatter.format(representativeDate)}`,
+        dateKey: lastParts.dateKey,
+        value: weekVal,
+      });
+    }
+  }
+
+  return { points, total };
+}
